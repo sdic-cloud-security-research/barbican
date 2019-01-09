@@ -1,0 +1,151 @@
+Barbican demo for client protection
+
+1. Setting up a Barbican Development Environment
+
+    Installing system dependencies
+    for Ubuntu: git python-tox libffi-dev libssl-dev python-dev gcc
+    for CentOS: git python-tox gcc libffi-devel openssl-devel redhat-rpm-config
+
+    Clone our barbican source
+    # git clone https://github.com/sdic-cloud-security-research/barbican.git
+    # cd barbican
+
+    Create and activate a virtual environment
+    # virtualenv .barbicanenv
+    # . .barbicanenv/bin/activate
+
+    Install barbican in development mode
+    # pip install -e $PWD
+
+    Create the directories and copy the config files
+    # sudo mkdir /etc/barbican
+    # sudo mkdir /var/lib/barbican
+    # sudo chown $(whoami) /etc/barbican
+    # sudo chown $(whoami) /var/lib/barbican
+    # cp -r etc/barbican /etc
+
+    Enable unauthenticated API (i.e., do not use Keystone)
+    # vim /etc/barbican/barbican-api-paste.ini
+    Change the pipeline /v1 value from authenticated "barbican-api-keystone" to the unauthenticated "barbican_api"
+        [composite:main]
+        use = egg:Paste#urlmap
+        /: barbican_version
+        /v1: barbican_api
+
+    Install python package dependencies
+    # pip install pycryptodome
+
+    Running Barbican
+    # bin/barbican-api
+
+
+2. Preparation: upload a RSA public key into the Barbican (using two steps: post + put)
+
+    Open a new terminal
+    # cd barbican/demo
+    # cd upload_pub
+
+    # bash upload_step1.sh
+        Assume the returned "secret_ref" is "http://localhost:9311/v1/secrets/xxxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxx"
+    # bash upload_step2.sh xxxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxx
+
+
+3. Demo A: store a secret (e.g., a simple plaintext secret or a symmetric key) with the "plain" encryption mode
+
+    Open a new terminal
+    # cd barbican/demo/plain
+
+    Check the context of the secret
+    # xxd secret
+
+    Update the "protected" parameter according to the secret_ref of your uploaded RSA public key
+    # vim store_secret.sh
+        "protected": "RSA:OAEP:xxxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxx"
+
+    Store the secret
+    # bash store_secret.sh
+
+    Assume the returned content is:
+    {
+        "EKEK_ref": "http://localhost:9311/v1/secrets/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa",
+        "ESECRET_ref": "http://localhost:9311/v1/secrets/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb",
+        "IV_ref": "http://localhost:9311/v1/secrets/cccccccc-cccc-cccc-cccc-cccccccccc"
+    }
+
+    KEK: a random 128-bit KEK for AES-128-GCM
+    IV: a random 96-bit IV
+    EKEK: the encrypted KEK (encrypted by your uploaded RSA public key)
+    ESECRET: the encrypted secret (directly encrypted by KEK and IV)
+
+    Retrieve the payload of EKEK, ESECRET and IV (saved into files with the same names)
+    # bash retrieve_secret_payload.sh aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa EKEK
+    # bash retrieve_secret_payload.sh bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb ESECRET
+    # bash retrieve_secret_payload.sh aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa IV
+
+    Check the context of EKEK, ESECRET and IV
+    # xxd EKEK
+    # xxd ESECRET
+    # xxd IV
+
+    Use the local RSA private key (rsa_priv.pem) to decrypt EKEK and ESECRET (saved into EKEK.de and ESECRET.de)
+    Assume the python environment is ready
+    # pip install cryptography
+    # python decrypt.py
+    # xxd EKEK.de
+    # xxd ESECRET.de (should be the same as the output of "xxd secret")
+
+
+4. Demo B: store a rsa private secret with the "kpt" encryption mode
+
+    Open a new terminal
+    # cd barbican/demo/kpt
+
+    Check the context of the rsa private secret
+    # cat secret.pem
+
+    Update the "protected" parameter according to the secret_ref of your uploaded RSA public key
+    # vim store_secret_step1.sh
+        "protected": "RSA:OAEP:xxxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxx"
+
+    Store the secret (using two steps: post + put)
+    # bash store_secret_step1.sh
+        Assume the returned content is:
+        {
+            "EKEK_ref": "http://localhost:9311/v1/secrets/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa",
+            "ESECRET_ref": "http://localhost:9311/v1/secrets/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb",
+            "IV_ref": "http://localhost:9311/v1/secrets/cccccccc-cccc-cccc-cccc-cccccccccc"
+        }
+    # bash store_secret_step2.sh bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb
+
+    KEK: a random 128-bit KEK for AES-128-GCM
+    IV: a random 96-bit IV
+    EKEK: the encrypted KEK (encrypted by your uploaded RSA public key)
+    ESECRET: the encrypted kpt-format secret (encrypted by KEK and IV), which is still a PEM object (contains the information of IV, algorithm, wrapped rsa, etc.)
+
+    Notice:
+    In this situation, the uploaded RSA public key should come from a TPM.
+    KEK should be encrypted according to TPM duplication pattern.
+    In this demo, for simplicity, KEK is directly encrypted.
+
+    Retrieve the payload of ESECRET
+    # bash retrieve_secret_payload.sh bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb ESECRET
+    # cat ESECRET
+
+    Install OpenSSL with 1.1.0 version or later (in order to build the codes for parsing the kpt-format ESECRET)
+    # wget https://www.openssl.org/source/openssl-1.1.0j.tar.gz
+    # tar xvf openssl-1.1.0j.tar.gz
+    # cd openssl-1.1.0j
+    # ./config --prefix=$PWD/.openssl/ -Wl,-rpath,\${LIBRPATH}
+    # make -j32
+    # make install_sw
+
+    Build the codes for parsing the kpt-format ESECRET
+    # cd barbican/demo/kpt
+    # cd rsa_wpk_parse
+    # vim Makefile
+        change the value of OPENSSL_ROOT to your installed OpenSSL, e.g., ../openssl-1.1.0j/.openssl
+    # make
+
+    Parse the kpt-format ESECRET
+    # ./rsa_wpk_parse ../ESECRET
+    # cat wrapped_RSA (this is the encrypted RSA contained in ESECRET)

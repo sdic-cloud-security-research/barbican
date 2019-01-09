@@ -12,12 +12,14 @@
 
 from oslo_utils import timeutils
 import pecan
+import os
 from six.moves.urllib import parse
 
 from barbican import api
 from barbican.api import controllers
 from barbican.api.controllers import acls
 from barbican.api.controllers import secretmeta
+from barbican.api.controllers import protect_secret
 from barbican.common import accept
 from barbican.common import exception
 from barbican.common import hrefs
@@ -69,6 +71,12 @@ def _request_has_twsk_but_no_transport_key_id():
     pecan.abort(400, u._('Transport key wrapped session key has been '
                          'provided to wrap secrets for retrieval, but the '
                          'transport key id has not been provided.'))
+
+def _invalid_protected():
+    pecan.abort(400, u._('Invalid protected.'))
+
+def _invalid_inner_encryption():
+    pecan.abort(400, u._('Invalid inner_encryption.'))
 
 
 class SecretController(controllers.ACLMixin):
@@ -240,14 +248,93 @@ class SecretController(controllers.ACLMixin):
         content_type = pecan.request.content_type
         content_encoding = pecan.request.headers.get('Content-Encoding')
 
+        user_meta_repo = repo.get_secret_user_meta_repository()
+        metadata = user_meta_repo.get_metadata_for_secret(self.secret.id)
+        client_protected = metadata.get("protected")
+
+        if not client_protected:
+            plugin.store_secret(
+                unencrypted_raw=payload,
+                content_type_raw=content_type,
+                content_encoding=content_encoding,
+                secret_model=self.secret,
+                project_model=project_model,
+                transport_key_id=transport_key_id)
+            LOG.info('Updated secret for project: %s', external_project_id)
+            return
+
+        protected_list = client_protected.split(':')
+        inner_encryption = metadata.get('inner_encryption')
+        inner_encryption_list = inner_encryption.split(':')
+
+        kek = os.urandom(128/8)
+        iv = os.urandom(96/8)
+
+        if inner_encryption_list[0] == 'plain':
+            protected_payload = protect_secret.gcm_encrypt(payload, kek,
+                                    iv, content_type, content_encoding)
+        elif inner_encryption_list[0] == 'kpt':
+            protected_payload = protect_secret.kpt_encrypt(payload, kek,
+                                    iv, content_type, content_encoding)
+
+        secret_repo = repo.get_secret_repository()
+
+        pubk_id = protected_list[2]
+        if not utils.validate_id_is_uuid(pubk_id):
+            _invalid_secret_id()
+        secret_pubk = secret_repo.get_secret_by_id(
+                        entity_id=pubk_id, suppress_exception=True)
+        if not secret_pubk:
+            _secret_not_found()
+        pubk_project_id = secret_pubk.project.external_id
+        project_pubk = res.get_or_create_project(pubk_project_id)
+        pubk = plugin.get_secret('application/octet-stream',
+                                 secret_pubk, project_pubk, None, None)
+
+        if inner_encryption_list[0] == 'plain':
+            ekek = protect_secret.rsa_pub_encrypt(kek, pubk)
+        elif inner_encryption_list[0] == 'kpt':
+            ekek = protect_secret.tpm_rsa_duplication(kek, pubk)
+
+        ekek_id = metadata.get('EKEK_id')
+        if not utils.validate_id_is_uuid(ekek_id):
+            _invalid_secret_id()
+        secret_ekek = secret_repo.get_secret_by_id(
+                        entity_id=ekek_id, suppress_exception=True)
+        if not secret_ekek:
+            _secret_not_found()
+
+        iv_id = metadata.get('IV_id')
+        if not utils.validate_id_is_uuid(iv_id):
+            _invalid_secret_id()
+        secret_iv = secret_repo.get_secret_by_id(
+                        entity_id=iv_id, suppress_exception=True)
+        if not secret_iv:
+            _secret_not_found()
+
         plugin.store_secret(
-            unencrypted_raw=payload,
+            unencrypted_raw=protected_payload,
             content_type_raw=content_type,
             content_encoding=content_encoding,
             secret_model=self.secret,
             project_model=project_model,
             transport_key_id=transport_key_id)
-        LOG.info('Updated secret for project: %s', external_project_id)
+
+        plugin.store_secret(
+            unencrypted_raw=ekek,
+            content_type_raw='application/octet-stream',
+            content_encoding=None,
+            secret_model=secret_ekek,
+            project_model=project_model,
+            transport_key_id=transport_key_id)
+
+        plugin.store_secret(
+            unencrypted_raw=iv,
+            content_type_raw='application/octet-stream',
+            content_encoding=None,
+            secret_model=secret_iv,
+            project_model=project_model,
+            transport_key_id=transport_key_id)
 
     @index.when(method='DELETE')
     @utils.allow_all_content_types
@@ -434,8 +521,87 @@ class SecretsController(controllers.ACLMixin):
 
         secret_model = models.Secret(data)
 
+        client_protected = data.get('protected')
+
+        if not client_protected:
+            new_secret, transport_key_model = plugin.store_secret(
+                unencrypted_raw=data.get('payload'),
+                content_type_raw=data.get('payload_content_type',
+                                          'application/octet-stream'),
+                content_encoding=data.get('payload_content_encoding'),
+                secret_model=secret_model,
+                project_model=project,
+                transport_key_needed=transport_key_needed,
+                transport_key_id=data.get('transport_key_id'))
+
+            url = hrefs.convert_secret_to_href(new_secret.id)
+            LOG.debug('URI to secret is %s', url)
+
+            pecan.response.status = 201
+            pecan.response.headers['Location'] = url
+
+            LOG.info('Created a secret for project: %s',
+                     external_project_id)
+            if transport_key_model is not None:
+                tkey_url = hrefs.convert_transport_key_to_href(
+                    transport_key_model.id)
+                return {'secret_ref': url, 'transport_key_ref': tkey_url}
+            else:
+                return {'secret_ref': url}
+
+        protected_list = client_protected.split(':')
+        if protected_list[0] != 'RSA' or protected_list[1] != 'OAEP':
+            _invalid_protected()
+
+        inner_encryption = data.get('inner_encryption')
+        inner_encryption_list = inner_encryption.split(':')
+        if inner_encryption_list[0] != 'plain' and inner_encryption_list[0] != 'kpt':
+            _invalid_inner_encryption()
+        if inner_encryption_list[0] == 'kpt':
+            if secret_model.secret_type != 'private' or secret_model.algorithm != 'RSA':
+                _invalid_inner_encryption()
+        if inner_encryption_list[1] != 'AES-128-GCM':
+            _invalid_inner_encryption()
+
+        # protect the secret payload with a random kek
+        raw_payload = data.get('payload')
+        protected_payload = None
+        ekek = None
+        iv = None
+
+        if raw_payload:
+            kek = os.urandom(128/8)
+            iv = os.urandom(96/8)
+            content_type = data.get('payload_content_type')
+            content_encoding=data.get('payload_content_encoding')
+
+            if inner_encryption_list[0] == 'plain':
+                protected_payload = protect_secret.gcm_encrypt(raw_payload, kek,
+                                        iv, content_type, content_encoding)
+            elif inner_encryption_list[0] == 'kpt':
+                protected_payload = protect_secret.kpt_encrypt(raw_payload, kek,
+                                        iv, content_type, content_encoding)
+
+            # retrieve the protecting rsa public key
+            pubk_id = protected_list[2]
+            if not utils.validate_id_is_uuid(pubk_id):
+                _invalid_secret_id()
+            secret_pubk = self.secret_repo.get_secret_by_id(
+                            entity_id=pubk_id, suppress_exception=True)
+            if not secret_pubk:
+                _secret_not_found()
+            pubk_project_id = secret_pubk.project.external_id
+            project_pubk = res.get_or_create_project(pubk_project_id)
+            pubk = plugin.get_secret('application/octet-stream',
+                                     secret_pubk, project_pubk, None, None)
+
+            if inner_encryption_list[0] == 'plain':
+                ekek = protect_secret.rsa_pub_encrypt(kek, pubk)
+            elif inner_encryption_list[0] == 'kpt':
+                ekek = protect_secret.tpm_rsa_duplication(kek, pubk)
+
         new_secret, transport_key_model = plugin.store_secret(
-            unencrypted_raw=data.get('payload'),
+            unencrypted_raw=protected_payload,
             content_type_raw=data.get('payload_content_type',
                                       'application/octet-stream'),
             content_encoding=data.get('payload_content_encoding'),
@@ -443,18 +609,40 @@ class SecretsController(controllers.ACLMixin):
             project_model=project,
             transport_key_needed=transport_key_needed,
             transport_key_id=data.get('transport_key_id'))
-
         url = hrefs.convert_secret_to_href(new_secret.id)
-        LOG.debug('URI to secret is %s', url)
 
-        pecan.response.status = 201
-        pecan.response.headers['Location'] = url
+        data['name'] = 'EKEK'
+        secret_model = models.Secret(data)
+        new_secret_ekek, transport_key_model_ekek = plugin.store_secret(
+            unencrypted_raw=ekek,
+            content_type_raw='application/octet-stream',
+            content_encoding=None,
+            secret_model=secret_model,
+            project_model=project,
+            transport_key_needed=transport_key_needed,
+            transport_key_id=data.get('transport_key_id'))
+        url_ekek = hrefs.convert_secret_to_href(new_secret_ekek.id)
 
-        LOG.info('Created a secret for project: %s',
-                 external_project_id)
-        if transport_key_model is not None:
-            tkey_url = hrefs.convert_transport_key_to_href(
-                transport_key_model.id)
-            return {'secret_ref': url, 'transport_key_ref': tkey_url}
-        else:
-            return {'secret_ref': url}
+        data['name'] = 'IV'
+        secret_model = models.Secret(data)
+        new_secret_iv, transport_key_model_iv = plugin.store_secret(
+            unencrypted_raw=iv,
+            content_type_raw='application/octet-stream',
+            content_encoding=None,
+            secret_model=secret_model,
+            project_model=project,
+            transport_key_needed=transport_key_needed,
+            transport_key_id=data.get('transport_key_id'))
+        url_iv = hrefs.convert_secret_to_href(new_secret_iv.id)
+
+        user_meta_repo = repo.get_secret_user_meta_repository()
+        user_meta_repo.create_replace_user_metadatum(new_secret.id,
+                        'protected', client_protected)
+        user_meta_repo.create_replace_user_metadatum(new_secret.id,
+                        'inner_encryption', inner_encryption)
+        user_meta_repo.create_replace_user_metadatum(new_secret.id,
+                        'EKEK_id', new_secret_ekek.id)
+        user_meta_repo.create_replace_user_metadatum(new_secret.id,
+                        'IV_id', new_secret_iv.id)
+
+        return {'ESECRET_ref': url, 'EKEK_ref': url_ekek, 'IV_ref': url_iv}

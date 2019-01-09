@@ -187,6 +187,8 @@ class NewSecretValidator(ValidatorBase):
                     "enum": ["true", "false"]
                 },
                 "transport_key_id": {"type": "string"},
+                "protected": {"type": "string"},
+                "inner_encryption": {"type": "string"},
             },
         }
 
@@ -196,6 +198,8 @@ class NewSecretValidator(ValidatorBase):
         self._assert_schema_is_valid(json_data, schema_name)
 
         json_data['name'] = self._extract_name(json_data)
+        json_data['protected'] = self._extract_protected(json_data)
+        json_data['inner_encryption'] = self._extract_inner_encryption(json_data)
 
         expiration = self._extract_expiration(json_data, schema_name)
         self._assert_expiration_is_valid(expiration, schema_name)
@@ -237,6 +241,20 @@ class NewSecretValidator(ValidatorBase):
         name = json_data.get('name')
         if isinstance(name, six.string_types):
             return name.strip()
+        return None
+
+    def _extract_protected(self, json_data):
+        """Extracts and returns the protected from the JSON data."""
+        protected = json_data.get('protected')
+        if isinstance(protected, six.string_types):
+            return protected.strip()
+        return None
+
+    def _extract_inner_encryption(self, json_data):
+        """Extracts and returns the inner_encryption from the JSON data."""
+        inner_encryption = json_data.get('inner_encryption')
+        if isinstance(inner_encryption, six.string_types):
+            return inner_encryption.strip()
         return None
 
     def _extract_expiration(self, json_data, schema_name):
